@@ -1,6 +1,6 @@
-# GraphRAG — Knowledge Graph Enhanced Retrieval-Augmented Generation
+# Simple RAG — Hybrid Retrieval-Augmented Generation
 
-Extends hybrid RAG with **entity extraction**, **co-occurrence knowledge graph**, **community detection**, and **three distinct query modes** — each optimized for a different question type.
+A production-quality RAG pipeline that answers questions over podcast transcripts using **hybrid dense + sparse retrieval**, cross-encoder reranking, and your choice of LLM.
 
 ---
 
@@ -10,51 +10,54 @@ Extends hybrid RAG with **entity extraction**, **co-occurrence knowledge graph**
 SRT Transcripts
       │
       ▼
-  parse → clean → chunk → embed          ← Same pipeline as Simple RAG
+  parse_srt()          ← Extract text + timestamps from .srt files
       │
-      ├──► VectorStore (ChromaDB)
-      ├──► BM25Index
+  clean_srt_blocks()   ← Remove filler markers, HTML, music symbols
       │
-      └──► Entity Extraction (spaCy NER)
+  chunk_segments()     ← Sliding window (500 tokens, 80 overlap)
+      │
+      ├──► VectorStore (ChromaDB)    ← Dense embeddings (BAAI/bge-small-en-v1.5)
+      └──► BM25Index                 ← Sparse keyword index
                 │
                 ▼
-         Co-occurrence Graph (NetworkX)
-         Nodes: unique entities
-         Edges: shared chunk, weight = co-occurrence count
+         Query at runtime
+                │
+      Dense (top-20) + Sparse (top-20)
+                │
+      reciprocal_rank_fusion()       ← 60% dense · 40% sparse
+                │
+      Cross-encoder Reranker         ← ms-marco-MiniLM-L-6-v2 → top-5
                 │
                 ▼
-         Community Detection (greedy modularity)
+          LLM Generation             ← gpt-4o-mini  or  llama-3.3-70b
                 │
                 ▼
-         LLM Community Summaries (cached)
-                │
-                ▼
-    ┌───────────┼───────────┐
-    ▼           ▼           ▼
-  LOCAL       GLOBAL     HYBRID
-  mode        mode        mode
+        Answer + Source Excerpts
 ```
 
-### Three Query Modes
+### Key Design Decisions
 
-| Mode | Best For | Retrieval Strategy |
-|------|----------|--------------------|
-| **Local** | Specific facts, entity relationships | Dense+BM25 → RRF → extract query entities → 1-hop graph expansion → rerank |
-| **Global** | Themes, synthesis, "what topics..." | Embed query → cosine vs community summaries → collect community chunks → rerank |
-| **Hybrid** | Balanced / unknown question type | Run Local + Global → merge (0.8× weight to global) → rerank |
+| Component | Choice | Reason |
+|-----------|--------|--------|
+| Embeddings | `BAAI/bge-small-en-v1.5` (384-dim) | Fast, high-quality, runs locally |
+| Vector DB | ChromaDB with HNSW + cosine | Persistent, no server needed |
+| Sparse search | BM25Okapi | Catches exact keyword matches dense search misses |
+| Fusion | Reciprocal Rank Fusion | Combines rankings without score normalization |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Precision boost before LLM call |
+| LLM | OpenAI / Groq | User-selectable at runtime |
 
 ---
 
 ## Project Structure
 
 ```
-GraphRAG/
-├── graph_pipeline.py    # Core logic: graph construction, community detection, 3 query modes
-├── app.py               # Streamlit chat + Knowledge Graph viewer
+Simple_RAG/
+├── rag_pipeline.py      # Core logic: parsing, chunking, retrieval, generation
+├── app.py               # Streamlit chat interface
 ├── requirements.txt     # Python dependencies
-└── graph_store/         # Auto-created: ChromaDB + graph state + chunk cache
+└── rag_store/           # Auto-created: ChromaDB + chunk cache + state
     ├── chroma/
-    ├── graph_state.pkl
+    ├── rag_state.json
     └── <hash>_chunks.json
 ```
 
@@ -65,14 +68,13 @@ GraphRAG/
 ### 1. Install dependencies
 
 ```bash
-cd GraphRAG
+cd Simple_RAG
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
 ```
 
 ### 2. Configure API keys
 
-Create a `.env` file in the `GraphRAG/` directory:
+Create a `.env` file in the `Simple_RAG/` directory:
 
 ```env
 # Choose one or both
@@ -90,94 +92,13 @@ streamlit run app.py
 
 ## Usage
 
-### Chat Tab
+1. **Upload transcripts** — Drag `.srt` files into the sidebar upload area. Progress bars show chunking and embedding status. Ingested files are cached and persist across sessions.
 
-1. **Upload transcripts** — Drag `.srt` files into the sidebar. Ingestion runs the full pipeline: chunking → embedding → NER → graph construction → community detection → summary generation (LLM call per community, cached to disk).
+2. **Select your LLM** — Switch between OpenAI (`gpt-4o-mini`) and Groq (`llama-3.3-70b`) from the sidebar.
 
-2. **Select query mode** — Choose Local, Global, or Hybrid depending on your question type.
+3. **Tune retrieval** *(optional)* — Adjust chunk size, overlap, top-K candidates, and top-N final chunks via sidebar sliders.
 
-3. **Select your LLM** — OpenAI (`gpt-4o-mini`) or Groq (`llama-3.3-70b`).
-
-4. **Ask questions** — The response includes the answer, the entities used to expand retrieval, the communities considered, and source excerpts.
-
-### Knowledge Graph Tab
-
-Inspect the graph that was built from your documents:
-
-- Node count, edge count, connected component statistics
-- Top entities by degree centrality
-- Community list with member entity counts
-- Per-community entity breakdown
-
----
-
-## Pipeline Detail
-
-### Entity Extraction
-
-spaCy `en_core_web_sm` NER extracts the following entity types per chunk:
-
-`PERSON · ORG · GPE · PRODUCT · EVENT · WORK_OF_ART · NORP · LAW · FAC`
-
-Filters applied: length > 2 characters, non-numeric, lowercased and deduplicated.
-
-### Graph Construction
-
-```python
-for each chunk:
-    entities = extract_entities(chunk.text)
-    for each pair (e1, e2) in entities:
-        graph.add_edge(e1, e2, weight += 1)
-```
-
-Maintains a reverse index: `entity → list of chunk IDs` for fast graph-guided retrieval.
-
-### Community Detection
-
-NetworkX `greedy_modularity_communities` runs independently per connected component. No manual hyperparameter tuning — the algorithm optimises modularity automatically.
-
-### Community Summaries
-
-One LLM call per community generates a paragraph-length summary of the community's key topics. Summaries are cached to `graph_store/graph_state.pkl` and reused on restart.
-
----
-
-## Query Mode Detail
-
-### Local Mode
-
-```
-1. Dense search (ChromaDB) → top-20
-2. BM25 search             → top-20
-3. RRF fusion              → merged ranking
-4. Extract entities from query (spaCy)
-5. For each entity:  look up graph neighbors (1 hop)
-6. Collect chunks associated with neighbor entities
-7. Merge with step-3 results, deduplicate
-8. Cross-encoder rerank → top-5
-9. LLM generation with entity context
-```
-
-### Global Mode
-
-```
-1. Embed query (bge-small)
-2. Cosine similarity vs all community summary embeddings → top-3 communities
-3. Collect all chunks belonging to those communities
-4. Cross-encoder rerank → top-5
-5. LLM generation with community summaries prepended to context
-```
-
-### Hybrid Mode
-
-```
-1. Run Local  → local_chunks   (entity-expanded)
-2. Run Global → global_chunks  (community-selected)
-3. Merge:  unique(local_chunks ∪ global_chunks)
-           weight global chunks × 0.8 in reranking
-4. Cross-encoder rerank → top-5
-5. LLM generation with both chunk types + community summaries
-```
+4. **Ask questions** — Type any question in the chat input. The app returns an answer with expandable source excerpts and timestamps.
 
 ---
 
@@ -185,55 +106,47 @@ One LLM call per community generates a paragraph-length summary of the community
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `CHUNK_SIZE` | 500 | Tokens per chunk |
-| `CHUNK_OVERLAP` | 80 | Overlap tokens |
-| `TOP_K` | 20 | Candidates before reranking |
-| `TOP_N` | 5 | Final chunks for LLM |
-| `COMMUNITY_TOP_K` | 3 | Communities selected in Global mode |
-| `GLOBAL_WEIGHT` | 0.8 | Score multiplier for global chunks in Hybrid mode |
+| `RAG_CHUNK_SIZE` | 500 | Tokens per chunk |
+| `RAG_OVERLAP` | 80 | Overlap tokens between consecutive chunks |
+| `RAG_TOP_K` | 20 | Candidates retrieved before reranking |
+| `RAG_TOP_N` | 5 | Final chunks passed to LLM |
+
+---
+
+## Retrieval Pipeline (Detail)
+
+**Hybrid Search**
+- Dense: embed query with `bge-small` → cosine similarity in ChromaDB → top-20
+- Sparse: tokenize query → BM25 scoring → top-20
+- Fusion: RRF with `k=60` smoothing, 60 % dense weight
+
+**Reranking**
+- Build (query, chunk) pairs for all unique candidates
+- Score with cross-encoder → keep top-N by relevance score
+
+**Context Assembly**
+- Prepend source file name and timestamp range to each chunk
+- Concatenate top-N chunks into a single context block for the LLM
 
 ---
 
 ## State Persistence
 
+The pipeline saves state after every ingest so you never re-process the same file:
+
 | File | Contents |
 |------|----------|
-| `graph_store/chroma/` | ChromaDB vector index |
-| `graph_store/graph_state.pkl` | NetworkX graph + entity→chunks map + community assignments + LLM summaries |
-| `graph_store/<hash>_chunks.json` | Raw text chunks per source |
+| `rag_store/chroma/` | ChromaDB on-disk index (embeddings + metadata) |
+| `rag_store/rag_state.json` | List of ingested source files |
+| `rag_store/<hash>_chunks.json` | Raw chunks per source (for BM25 rebuild) |
 
-> **Note:** `graph_state.pkl` is tied to the exact Python environment. If you upgrade `networkx` or change the pipeline classes, delete this file and re-ingest.
-
----
-
-## When to Use Each Mode
-
-| Question Type | Example | Recommended Mode |
-|---------------|---------|-----------------|
-| Specific fact | "What did Jensen say about CUDA?" | Local |
-| Entity relationship | "How are Sam Altman and OpenAI connected?" | Local |
-| Thematic | "What are the main AI safety themes discussed?" | Global |
-| Cross-document synthesis | "Compare how each guest views AGI timelines" | Global or Hybrid |
-| Unknown / general | Any question when unsure | Hybrid |
-
----
-
-## Comparison with Simple RAG
-
-| Feature | Simple RAG | GraphRAG |
-|---------|------------|----------|
-| Retrieval | Hybrid dense+sparse | Hybrid + graph expansion |
-| Entity linking | No | Yes (spaCy NER) |
-| Cross-doc reasoning | Limited | Via community summaries |
-| Query modes | One (hybrid search) | Three (Local / Global / Hybrid) |
-| Ingest time | Fast | Slower (NER + graph + LLM summaries) |
-| Best for | Factual lookup | Relational + thematic questions |
+On startup, the app detects existing state and restores the BM25 index without re-embedding.
 
 ---
 
 ## Limitations
 
-- NER quality depends on `en_core_web_sm` — a small model. Rare entities may be missed.
-- `graph_state.pkl` is not forward-compatible across major library versions.
-- Community summary generation adds one LLM call per community on first ingest (cached afterward).
-- Not designed for concurrent multi-user ingestion (single pickle file).
+- Flat retrieval — all chunks are treated equally regardless of speaker or topic
+- No cross-document entity linking or relationship modeling
+- Weaker at synthesis questions that require reasoning across multiple topics
+- spaCy NER not used here — see the **GraphRAG** folder for entity-aware retrieval
