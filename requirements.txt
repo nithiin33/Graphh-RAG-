@@ -27,11 +27,3 @@ tiktoken==0.9.0
 numpy==2.2.4
 pandas==2.2.3
 tqdm==4.67.1
-
-# ─── GraphRAG Specific ────────────────────────────────────
-# NER for entity extraction
-spacy==3.8.4
-# After installing, run: python -m spacy download en_core_web_sm
-
-# Knowledge graph construction & community detection
-networkx==3.4.2
